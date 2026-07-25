@@ -108,7 +108,6 @@ info "Preparing Docker volume directories..."
 
 mkdir -p supabase/docker/volumes/api
 mkdir -p supabase/docker/volumes/db/data
-mkdir -p supabase/docker/volumes/db/init
 mkdir -p supabase/docker/volumes/storage
 
 ok "Directories ready"
@@ -120,7 +119,7 @@ $COMPOSE up -d db
 
 info "Waiting for database to be healthy..."
 for i in $(seq 1 40); do
-  if $COMPOSE exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+  if $COMPOSE exec -T db pg_isready -U supabase_admin >/dev/null 2>&1; then
     ok "Database is ready"
     break
   fi
@@ -132,50 +131,27 @@ for i in $(seq 1 40); do
 done
 echo ""
 
+# ─── Fix DB user passwords ────────────────────────────────────────────────
+info "Setting database user passwords..."
+
+$COMPOSE exec -T db psql -U supabase_admin -d postgres -c "
+ALTER USER authenticator WITH PASSWORD '${POSTGRES_PASSWORD}';
+ALTER USER supabase_storage_admin WITH PASSWORD '${POSTGRES_PASSWORD}';
+" 2>/dev/null
+
+ok "Database users configured"
+
 # ─── Run database migration ────────────────────────────────────────────────
 info "Running database migration..."
 
-$COMPOSE exec -T db psql -U postgres -d postgres -f /dev/stdin < supabase/migrations/001_initial_schema.sql 2>/dev/null \
+$COMPOSE exec -T db psql -U supabase_admin -d postgres -f /dev/stdin < supabase/migrations/001_initial_schema.sql 2>/dev/null \
   || {
     warn "Direct stdin failed, copying migration file..."
     $COMPOSE cp supabase/migrations/001_initial_schema.sql "$( $COMPOSE ps -q db)":/tmp/001_initial_schema.sql
-    $COMPOSE exec -T db psql -U postgres -d postgres -f /tmp/001_initial_schema.sql
+    $COMPOSE exec -T db psql -U supabase_admin -d postgres -f /tmp/001_initial_schema.sql
   }
 
 ok "Database migration complete"
-
-# ─── Create storage bucket ─────────────────────────────────────────────────
-info "Creating storage bucket for logo uploads..."
-
-$COMPOSE exec -T db psql -U postgres -d postgres <<'SQL' 2>/dev/null || warn "Storage bucket setup skipped (may already exist)"
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM storage.buckets WHERE id = 'logos') THEN
-    INSERT INTO storage.buckets (id, name, public) VALUES ('logos', 'logos', true);
-  END IF;
-END
-$$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Authenticated users can upload logos') THEN
-    CREATE POLICY "Authenticated users can upload logos" ON storage.objects
-      FOR INSERT WITH CHECK (bucket_id = 'logos' AND auth.role() = 'authenticated');
-  END IF;
-END
-$$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Anyone can view logos') THEN
-    CREATE POLICY "Anyone can view logos" ON storage.objects
-      FOR SELECT USING (bucket_id = 'logos');
-  END IF;
-END
-$$;
-SQL
-
-ok "Storage bucket configured"
 
 # ─── Start all services ────────────────────────────────────────────────────
 info "Starting all services..."
@@ -197,6 +173,81 @@ for i in $(seq 1 60); do
   printf '.'
 done
 echo ""
+
+# ─── Create storage bucket (after storage service is running) ──────────────
+info "Configuring storage..."
+
+for i in $(seq 1 30); do
+  if curl -sf http://localhost:5000/ >/dev/null 2>&1; then
+    break
+  fi
+  if [ "$i" -eq 30 ]; then
+    warn "Storage service not responding, skipping bucket setup"
+    break
+  fi
+  sleep 2
+done
+
+# Grant storage schema permissions
+$COMPOSE exec -T db psql -U supabase_admin -d postgres <<'SQL' 2>/dev/null || true
+GRANT ALL ON SCHEMA storage TO service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA storage TO service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA storage TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA storage GRANT ALL ON TABLES TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA storage GRANT ALL ON SEQUENCES TO service_role;
+GRANT USAGE ON SCHEMA storage TO anon;
+GRANT SELECT ON ALL TABLES IN SCHEMA storage TO anon;
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'service_role_all_buckets') THEN
+    CREATE POLICY "service_role_all_buckets" ON storage.buckets
+      FOR ALL TO service_role USING (true) WITH CHECK (true);
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'anon_read_public_buckets') THEN
+    CREATE POLICY "anon_read_public_buckets" ON storage.buckets
+      FOR SELECT TO anon USING (public = true);
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'service_role_all_objects') THEN
+    CREATE POLICY "service_role_all_objects" ON storage.objects
+      FOR ALL TO service_role USING (true) WITH CHECK (true);
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'anon_read_public_objects') THEN
+    CREATE POLICY "anon_read_public_objects" ON storage.objects
+      FOR SELECT TO anon USING (true);
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'authenticated_insert_objects') THEN
+    CREATE POLICY "authenticated_insert_objects" ON storage.objects
+      FOR INSERT TO authenticated WITH CHECK (true);
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'authenticated_read_objects') THEN
+    CREATE POLICY "authenticated_read_objects" ON storage.objects
+      FOR SELECT TO authenticated USING (true);
+  END IF;
+END $$;
+SQL
+
+# Create logos bucket via storage API
+SERVICE_KEY_VAL=$(grep SERVICE_ROLE_KEY .env | cut -d= -f2)
+for i in $(seq 1 10); do
+  RESULT=$(curl -sf http://localhost:5000/bucket \
+    -H "Authorization: Bearer ${SERVICE_KEY_VAL}" \
+    -H "Content-Type: application/json" \
+    -H "apikey: ${SERVICE_KEY_VAL}" \
+    -d '{"id":"logos","name":"logos","public":true}' 2>&1) && break
+  sleep 2
+done
+
+ok "Storage configured"
 
 # ─── Print summary ─────────────────────────────────────────────────────────
 echo ""
