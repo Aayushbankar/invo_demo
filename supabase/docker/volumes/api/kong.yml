@@ -1,0 +1,54 @@
+_format_version: "3.2"
+_transforms: []
+
+services:
+  - name: auth-v1-open
+    url: http://supabase-auth:9999/verify
+    routes:
+      - name: auth-v1-open
+        strip_path: /auth/v1/verify
+        paths:
+          - /auth/v1/verify
+    plugins:
+      - name: cors
+  - name: auth-v1
+    url: http://supabase-auth:9999/
+    routes:
+      - name: auth-v1
+        strip_path: /auth/v1
+        paths:
+          - /auth/v1
+    plugins:
+      - name: cors
+
+  - name: rest-v1
+    url: http://supabase-rest:3000/
+    routes:
+      - name: rest-v1
+        strip_path: /rest/v1
+        paths:
+          - /rest/v1
+    plugins:
+      - name: cors
+
+  - name: storage-v1
+    url: http://supabase-storage:5000/
+    routes:
+      - name: storage-v1
+        strip_path: /storage/v1
+        paths:
+          - /storage/v1
+    plugins:
+      - name: cors
+
+  - name: meta
+    url: http://supabase-meta:8080/
+    plugins:
+      - name: basic-auth
+        config:
+          hide_credentials: false
+    routes:
+      - name: meta
+        strip_path: /pg
+        paths:
+          - /pg
